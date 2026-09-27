@@ -1,0 +1,28 @@
+name: tg2dis mirror
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # каждые 5 минут (минимальный интервал у GitHub)
+  workflow_dispatch:          # можно запускать вручную из вкладки Actions
+
+# не даём двум запускам работать одновременно (иначе задвоятся посты)
+concurrency:
+  group: tg2dis-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python poll_bot.py
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_SOURCE_CHAT_ID: ${{ secrets.TG_SOURCE_CHAT_ID }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          MAX_FILE_MB: "20"
