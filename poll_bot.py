@@ -22,9 +22,12 @@ tg2disbot (режим БОТА) — копирует посты из Telegram-к
 import base64
 import json
 import os
+import sys
 import time
 
 import requests
+
+FAILURES = []  # накопленные ошибки отправки -> прогон завершится с ошибкой (красный run)
 
 try:
     from dotenv import load_dotenv
@@ -120,7 +123,10 @@ def discord_request(payload, files=None):
 def discord_post(content, files=None):
     resp = discord_request({"content": content}, files or None)
     if resp.status_code >= 400:
-        print(f"[discord] ошибка {resp.status_code}: {resp.text}")
+        msg = f"[discord] ошибка {resp.status_code}: {resp.text[:300]}"
+        print(msg); FAILURES.append(msg)
+        return False
+    return True
 
 
 def chunk_text(text, size=DISCORD_MSG_LIMIT):
@@ -152,9 +158,11 @@ def send_poll(msg):
     }}
     resp = discord_request(payload)
     if resp.status_code >= 400:
-        print(f"[discord] опрос не отправлен {resp.status_code}: {resp.text}")
-        # фолбэк: хотя бы ссылкой на оригинал
-        discord_post("📊 Опрос — смотрите в Telegram:\n" + post_link(msg))
+        m = f"[discord] опрос #{msg['message_id']} не отправлен {resp.status_code}: {resp.text[:300]}"
+        print(m); FAILURES.append(m)
+        discord_post("📊 Опрос — смотрите в Telegram:\n" + post_link(msg))  # фолбэк ссылкой
+    else:
+        print(f"[send] опрос #{msg['message_id']} -> Discord poll ({POLL_HOURS}ч)")
 
 
 def send_voice(msg):
@@ -179,10 +187,11 @@ def send_voice(msg):
     }]}
     resp = discord_request(payload, [("voice-message.ogg", blob, "audio/ogg")])
     if resp.status_code >= 400:
-        # фолбэк: обычное аудио-вложение (+ подпись в этом же сообщении)
-        print(f"[discord] voice -> фолбэк на вложение ({resp.status_code}): {resp.text}")
+        # не считаем провалом: деградируем на обычное .ogg-вложение (+ подпись)
+        print(f"[warn] voice #{msg['message_id']} -> фолбэк на вложение ({resp.status_code}): {resp.text[:200]}")
         discord_post(caption, [("voice-message.ogg", blob, "audio/ogg")])
         return
+    print(f"[send] голосовое #{msg['message_id']} -> voice message")
     if caption:
         discord_post(caption)
 
@@ -202,6 +211,9 @@ def send_media_group(posts):
             if blob is not None:
                 files.append((media["name"] or fname or "file", blob))
                 continue
+            print(f"[warn] пост #{msg['message_id']}: файл не скачался -> ссылка")
+        else:
+            print(f"[info] пост #{msg['message_id']}: файл >{MAX_FILE_BYTES // 1048576}МБ -> ссылка")
         links.append(post_link(msg))  # слишком большой или не скачался
 
     text = "\n\n".join(texts).strip()
@@ -209,7 +221,12 @@ def send_media_group(posts):
         text = (text + "\n\n" if text else "") + \
                "📎 Файлы больше 20 МБ — смотрите в Telegram:\n" + "\n".join(links)
     if not text and not files:
+        ids = ",".join(str(m.get("message_id")) for m in posts)
+        keys = sorted(set(k for m in posts for k in m))
+        print(f"[warn] нечего отправить для поста(ов) #{ids} — тип не поддержан? поля: {keys}")
         return
+    print(f"[send] пост(ы) #{','.join(str(m['message_id']) for m in posts)}: "
+          f"файлов {len(files)}, ссылок {len(links)}")
 
     chunks = chunk_text(text) if text else [""]
     batches = [files[i:i + DISCORD_FILES_LIMIT]
@@ -267,6 +284,9 @@ def main():
         if len(updates) < 100:
             break
     print(f"[ok] обработано постов: {total}")
+    if FAILURES:
+        print(f"[FAIL] ошибок отправки в Discord: {len(FAILURES)} — прогон помечен как упавший")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
