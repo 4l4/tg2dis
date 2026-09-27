@@ -1,11 +1,15 @@
 name: tg2dis mirror
 
 on:
+  # cron у GitHub ненадёжен и часто задерживается/пропускается, поэтому он тут
+  # нужен лишь чтобы ИНОГДА стартовать джоб. Сам опрос крутится циклом внутри
+  # запуска ~5.5 часа, а concurrency ставит следующий запуск встык в очередь —
+  # так получается почти непрерывный опрос каждые 10 минут без сторонних сервисов.
   schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут
-  workflow_dispatch:          # запуск вручную из вкладки Actions
+    - cron: "*/10 * * * *"
+  workflow_dispatch:          # ручной старт (и для «раскачки» цепочки после простоя)
 
-# не даём двум запускам работать одновременно (иначе задвоятся посты)
+# один запуск в момент времени; следующий ждёт в очереди и стартует встык
 concurrency:
   group: tg2dis-mirror
   cancel-in-progress: false
@@ -13,13 +17,14 @@ concurrency:
 jobs:
   mirror:
     runs-on: ubuntu-latest
+    timeout-minutes: 350        # жёсткий предохранитель (лимит GitHub — 360 мин)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python poll_bot.py
+      - name: Poll loop
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_SOURCE_CHAT_ID: ${{ secrets.TG_SOURCE_CHAT_ID }}
@@ -27,3 +32,17 @@ jobs:
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           MAX_FILE_MB: "20"
           POLL_HOURS: "24"
+          LOOP_MINUTES: "330"     # крутим ~5.5ч, потом джоб завершается штатно
+          POLL_INTERVAL: "600"    # опрос каждые 10 минут
+        run: |
+          end=$(( $(date +%s) + LOOP_MINUTES * 60 ))
+          failed=0
+          while :; do
+            if ! python poll_bot.py; then
+              echo "::error::poll_bot.py завершился с ошибкой (подробности в логе выше)"
+              failed=1
+            fi
+            [ "$(date +%s)" -ge "$end" ] && break
+            sleep "$POLL_INTERVAL"
+          done
+          exit $failed
