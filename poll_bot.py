@@ -9,12 +9,20 @@ tg2disbot (режим БОТА) — копирует посты из Telegram-к
 (offset подтверждается на его стороне). Поэтому подходит для запуска по cron
 (в т.ч. GitHub Actions) — просто дёргайте его периодически.
 
+Поддерживаемые типы постов:
+  * текст, фото, видео, документы, аудио, гиф (animation), альбомы;
+  * кружки (video_note)     -> обычное видео (.mp4);
+  * голосовые (voice)       -> нативное voice message в Discord (с фолбэком на .ogg-вложение);
+  * опросы (poll)           -> нативный опрос в Discord (таймер POLL_HOURS, по умолчанию 24ч).
+
 Файлы <=20 МБ пересылаются вложением; больше 20 МБ Bot API скачать не может —
 для них ставится ссылка на исходный пост в Telegram.
 """
 
+import base64
 import json
 import os
+import time
 
 import requests
 
@@ -29,13 +37,17 @@ DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 DISCORD_CHANNEL_ID = os.environ["DISCORD_CHANNEL_ID"]
 SOURCE_CHAT = os.environ.get("TG_SOURCE_CHAT_ID")  # необязательный фильтр (id или @username)
 MAX_FILE_BYTES = int(float(os.environ.get("MAX_FILE_MB", "20")) * 1024 * 1024)
+POLL_HOURS = int(os.environ.get("POLL_HOURS", "24"))  # таймер опроса в Discord
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 DISCORD_API = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
 DISCORD_HEADERS = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
 DISCORD_MSG_LIMIT = 2000
 DISCORD_FILES_LIMIT = 10
-MEDIA_KEYS = ("video", "document", "audio", "animation", "voice", "video_note")
+FLAG_VOICE_MESSAGE = 1 << 13  # IS_VOICE_MESSAGE
+
+# обычные вложения (кружок отдаём как видео; voice/poll обрабатываются отдельно)
+MEDIA_KEYS = ("photo", "video", "video_note", "document", "audio", "animation")
 
 
 # ---------- Telegram ----------
@@ -50,14 +62,17 @@ def get_updates(offset=None):
 
 
 def extract_media(msg):
-    """Возвращает (file_id, size, filename) для медиа в посте или None."""
+    """Возвращает dict(file_id, size, name) для обычного медиа поста или None."""
     if "photo" in msg:
         p = msg["photo"][-1]  # самый большой размер
-        return p["file_id"], p.get("file_size", 0), None
-    for k in MEDIA_KEYS:
+        return {"file_id": p["file_id"], "size": p.get("file_size", 0), "name": None}
+    if "video_note" in msg:  # кружок -> обычное видео (имени файла в API нет)
+        f = msg["video_note"]
+        return {"file_id": f["file_id"], "size": f.get("file_size", 0), "name": "video_note.mp4"}
+    for k in ("video", "document", "audio", "animation"):
         if k in msg:
             f = msg[k]
-            return f["file_id"], f.get("file_size", 0), f.get("file_name")
+            return {"file_id": f["file_id"], "size": f.get("file_size", 0), "name": f.get("file_name")}
     return None
 
 
@@ -82,6 +97,32 @@ def post_link(msg):
 
 # ---------- Discord ----------
 
+def discord_request(payload, files=None):
+    """Низкоуровневая отправка: multipart при наличии файлов, иначе JSON. Ретрай на 429."""
+    if files:
+        data = {"payload_json": json.dumps(payload)}
+        file_args = []
+        for i, f in enumerate(files):
+            name, blob = f[0], f[1]
+            ctype = f[2] if len(f) > 2 else "application/octet-stream"
+            file_args.append((f"files[{i}]", (name, blob, ctype)))
+        resp = requests.post(DISCORD_API, headers=DISCORD_HEADERS,
+                             data=data, files=file_args, timeout=180)
+    else:
+        resp = requests.post(DISCORD_API, headers={**DISCORD_HEADERS, "Content-Type": "application/json"},
+                             json=payload, timeout=60)
+    if resp.status_code == 429:
+        time.sleep(float(resp.json().get("retry_after", 1)) + 0.5)
+        return discord_request(payload, files)
+    return resp
+
+
+def discord_post(content, files=None):
+    resp = discord_request({"content": content}, files or None)
+    if resp.status_code >= 400:
+        print(f"[discord] ошибка {resp.status_code}: {resp.text}")
+
+
 def chunk_text(text, size=DISCORD_MSG_LIMIT):
     chunks, cur = [], ""
     for line in text.split("\n"):
@@ -99,21 +140,55 @@ def chunk_text(text, size=DISCORD_MSG_LIMIT):
     return chunks or [""]
 
 
-def discord_post(content, files):
-    data = {"payload_json": json.dumps({"content": content})}
-    file_args = [(f"files[{i}]", (name, blob)) for i, (name, blob) in enumerate(files)]
-    resp = requests.post(DISCORD_API, headers=DISCORD_HEADERS,
-                         data=data, files=file_args or None, timeout=180)
-    if resp.status_code == 429:
-        import time
-        time.sleep(float(resp.json().get("retry_after", 1)) + 0.5)
-        return discord_post(content, files)
+def send_poll(msg):
+    """Telegram-опрос -> нативный опрос Discord с таймером POLL_HOURS."""
+    poll = msg["poll"]
+    answers = [{"poll_media": {"text": (o["text"] or " ")[:55]}} for o in poll["options"][:10]]
+    payload = {"poll": {
+        "question": {"text": poll["question"][:300]},
+        "answers": answers,
+        "duration": POLL_HOURS,
+        "allow_multiselect": poll.get("allows_multiple_answers", False),
+    }}
+    resp = discord_request(payload)
     if resp.status_code >= 400:
-        print(f"[discord] ошибка {resp.status_code}: {resp.text}")
+        print(f"[discord] опрос не отправлен {resp.status_code}: {resp.text}")
+        # фолбэк: хотя бы ссылкой на оригинал
+        discord_post("📊 Опрос — смотрите в Telegram:\n" + post_link(msg))
 
 
-def send_group(posts):
-    """posts — список постов одного альбома (или один пост списком)."""
+def send_voice(msg):
+    """Голосовое TG -> voice message Discord; при отказе — обычное .ogg-вложение."""
+    v = msg["voice"]
+    size = v.get("file_size", 0)
+    caption = (msg.get("caption") or "").strip()
+    if size and size > MAX_FILE_BYTES:
+        discord_post("🎤 Голосовое сообщение (>20 МБ) — в Telegram:\n" + post_link(msg))
+        return
+    blob, _ = download_file(v["file_id"])
+    if blob is None:
+        discord_post("🎤 Голосовое сообщение — в Telegram:\n" + post_link(msg))
+        return
+
+    duration = int(v.get("duration", 1)) or 1
+    # Bot API не отдаёт настоящую форму волны — генерируем плейсхолдер (только для UI).
+    waveform = base64.b64encode(bytes((i * 11) % 256 for i in range(48))).decode()
+    payload = {"flags": FLAG_VOICE_MESSAGE, "attachments": [{
+        "id": 0, "filename": "voice-message.ogg",
+        "duration_secs": duration, "waveform": waveform,
+    }]}
+    resp = discord_request(payload, [("voice-message.ogg", blob, "audio/ogg")])
+    if resp.status_code >= 400:
+        # фолбэк: обычное аудио-вложение (+ подпись в этом же сообщении)
+        print(f"[discord] voice -> фолбэк на вложение ({resp.status_code}): {resp.text}")
+        discord_post(caption, [("voice-message.ogg", blob, "audio/ogg")])
+        return
+    if caption:
+        discord_post(caption)
+
+
+def send_media_group(posts):
+    """Текст + обычные вложения (в т.ч. альбомы и кружки-как-видео)."""
     texts, files, links = [], [], []
     for msg in posts:
         t = msg.get("text") or msg.get("caption")
@@ -122,11 +197,10 @@ def send_group(posts):
         media = extract_media(msg)
         if not media:
             continue
-        file_id, size, name = media
-        if size and size <= MAX_FILE_BYTES:
-            blob, fname = download_file(file_id)
+        if media["size"] and media["size"] <= MAX_FILE_BYTES:
+            blob, fname = download_file(media["file_id"])
             if blob is not None:
-                files.append((name or fname or "file", blob))
+                files.append((media["name"] or fname or "file", blob))
                 continue
         links.append(post_link(msg))  # слишком большой или не скачался
 
@@ -145,7 +219,18 @@ def send_group(posts):
         discord_post(chunks.pop(0) if (first and chunks) else "", batch)
         first = False
     for c in chunks:
-        discord_post(c, [])
+        discord_post(c)
+
+
+def send_group(posts):
+    """Маршрутизация группы постов по типу (опрос/голосовое — всегда одиночные)."""
+    if len(posts) == 1:
+        msg = posts[0]
+        if "poll" in msg:
+            return send_poll(msg)
+        if "voice" in msg:
+            return send_voice(msg)
+    send_media_group(posts)
 
 
 def group_albums(posts):
