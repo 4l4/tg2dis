@@ -1,9 +1,11 @@
 name: tg2dis mirror
 
 on:
-  # cron у GitHub ненадёжен, поэтому он тут нужен лишь чтобы ИНОГДА стартовать джоб
-  # (и восстановить цепочку, если она оборвётся). Сам джоб держит long polling ~5.5ч
-  # и получает посты почти мгновенно; concurrency ставит следующий запуск встык.
+  # Короткие окна + частый cron. Каждый прогон живёт ~50 мин и завершается, а следующий
+  # (поставленный в очередь через concurrency) стартует встык. Окно (50м) длиннее интервала
+  # cron (30м), поэтому в очереди почти всегда ждёт готовый прогон -> опрос непрерывный.
+  # Если прогон подвиснет — timeout-minutes жёстко снимет его максимум за 55 мин, слот
+  # освободится, и цепочка продолжится сама (раньше зависание блокировало всё на часы).
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:          # ручной старт (и для «раскачки» цепочки после простоя)
@@ -16,12 +18,13 @@ concurrency:
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    timeout-minutes: 350        # жёсткий предохранитель (лимит GitHub — 360 мин)
+    timeout-minutes: 55         # авто-снятие зависшего прогона (штатно выходим на 50-й мин)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip            # кэш зависимостей — частые рестарты почти без накладных
       - run: pip install -r requirements.txt
       - name: Long polling
         env:
@@ -31,6 +34,6 @@ jobs:
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           MAX_FILE_MB: "20"
           POLL_HOURS: "24"
-          LOOP_MINUTES: "330"        # держим процесс ~5.5ч, потом штатный выход
+          LOOP_MINUTES: "50"         # держим процесс ~50 мин, потом штатный выход
           LONG_POLL_SECONDS: "50"    # getUpdates висит до 50с -> посты приходят почти мгновенно
         run: python poll_bot.py
