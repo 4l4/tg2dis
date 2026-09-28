@@ -4,10 +4,16 @@ tg2disbot (режим БОТА) — копирует посты из Telegram-к
 Работает через Telegram Bot API (getUpdates), без пользовательского аккаунта.
 Требование: бот должен быть АДМИНИСТРАТОРОМ канала-источника.
 
-Один запуск = разбор всех накопившихся постов и отправка их в Discord.
+Два режима (переключаются переменной LOOP_MINUTES):
+  * LOOP_MINUTES=0 (по умолч.) — разовый проход: забрать накопившееся и выйти
+    (удобно локально или под внешний cron);
+  * LOOP_MINUTES>0 — long polling: держим процесс заданное время и получаем посты
+    почти мгновенно (getUpdates висит открытым до появления апдейта). Так работает
+    в GitHub Actions: один прогон крутится ~5.5ч, следующий встаёт встык (concurrency).
+
 Скрипт ничего не хранит: подтверждённые посты Telegram сам больше не отдаёт
-(offset подтверждается на его стороне). Поэтому подходит для запуска по cron
-(в т.ч. GitHub Actions) — просто дёргайте его периодически.
+(offset подтверждается на его стороне). Важно: одновременно апдейты должен тянуть
+только ОДИН процесс (иначе getUpdates вернёт 409) — за этим следит concurrency.
 
 Поддерживаемые типы постов:
   * текст, фото, видео, документы, аудио, гиф (animation), альбомы;
@@ -41,6 +47,10 @@ DISCORD_CHANNEL_ID = os.environ["DISCORD_CHANNEL_ID"]
 SOURCE_CHAT = os.environ.get("TG_SOURCE_CHAT_ID")  # необязательный фильтр (id или @username)
 MAX_FILE_BYTES = int(float(os.environ.get("MAX_FILE_MB", "20")) * 1024 * 1024)
 POLL_HOURS = int(os.environ.get("POLL_HOURS", "24"))  # таймер опроса в Discord
+# Long polling: держим процесс до LOOP_MINUTES, каждый getUpdates висит до LONG_POLL_SECONDS.
+# LOOP_MINUTES=0 (по умолчанию) -> разовый проход и выход (удобно локально / под cron).
+LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "0"))
+LONG_POLL_SECONDS = int(os.environ.get("LONG_POLL_SECONDS", "50"))
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 DISCORD_API = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
@@ -55,11 +65,12 @@ MEDIA_KEYS = ("photo", "video", "video_note", "document", "audio", "animation")
 
 # ---------- Telegram ----------
 
-def get_updates(offset=None):
-    params = {"timeout": 0, "allowed_updates": json.dumps(["channel_post"])}
+def get_updates(offset=None, timeout=0):
+    # timeout>0 -> long polling: Telegram держит запрос открытым до появления апдейта.
+    params = {"timeout": timeout, "allowed_updates": json.dumps(["channel_post"])}
     if offset is not None:
         params["offset"] = offset
-    r = requests.get(f"{API}/getUpdates", params=params, timeout=60)
+    r = requests.get(f"{API}/getUpdates", params=params, timeout=timeout + 15)
     r.raise_for_status()
     return r.json().get("result", [])
 
@@ -80,13 +91,17 @@ def extract_media(msg):
 
 
 def download_file(file_id):
-    """Скачивает файл через Bot API. Работает только для файлов <=20 МБ."""
-    r = requests.get(f"{API}/getFile", params={"file_id": file_id}, timeout=60).json()
-    if not r.get("ok"):
+    """Скачивает файл через Bot API (только <=20 МБ). None,None при ошибке/сбое сети."""
+    try:
+        r = requests.get(f"{API}/getFile", params={"file_id": file_id}, timeout=60).json()
+        if not r.get("ok"):
+            return None, None
+        path = r["result"]["file_path"]
+        data = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=180).content
+        return data, os.path.basename(path)
+    except requests.exceptions.RequestException as e:
+        print(f"[warn] не удалось скачать файл: {e}")
         return None, None
-    path = r["result"]["file_path"]
-    data = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=180).content
-    return data, os.path.basename(path)
 
 
 def post_link(msg):
@@ -100,30 +115,38 @@ def post_link(msg):
 
 # ---------- Discord ----------
 
-def discord_request(payload, files=None):
-    """Низкоуровневая отправка: multipart при наличии файлов, иначе JSON. Ретрай на 429."""
-    if files:
-        data = {"payload_json": json.dumps(payload)}
-        file_args = []
-        for i, f in enumerate(files):
-            name, blob = f[0], f[1]
-            ctype = f[2] if len(f) > 2 else "application/octet-stream"
-            file_args.append((f"files[{i}]", (name, blob, ctype)))
-        resp = requests.post(DISCORD_API, headers=DISCORD_HEADERS,
-                             data=data, files=file_args, timeout=180)
-    else:
-        resp = requests.post(DISCORD_API, headers={**DISCORD_HEADERS, "Content-Type": "application/json"},
-                             json=payload, timeout=60)
+def discord_request(payload, files=None, _attempt=1):
+    """Отправка в Discord: multipart при файлах, иначе JSON.
+    Ретрай на 429 и на сетевых сбоях. Возвращает Response или None (сеть недоступна)."""
+    try:
+        if files:
+            data = {"payload_json": json.dumps(payload)}
+            file_args = []
+            for i, f in enumerate(files):
+                name, blob = f[0], f[1]
+                ctype = f[2] if len(f) > 2 else "application/octet-stream"
+                file_args.append((f"files[{i}]", (name, blob, ctype)))
+            resp = requests.post(DISCORD_API, headers=DISCORD_HEADERS,
+                                 data=data, files=file_args, timeout=180)
+        else:
+            resp = requests.post(DISCORD_API, headers={**DISCORD_HEADERS, "Content-Type": "application/json"},
+                                 json=payload, timeout=60)
+    except requests.exceptions.RequestException as e:
+        if _attempt <= 3:
+            time.sleep(2 * _attempt)
+            return discord_request(payload, files, _attempt + 1)
+        print(f"[warn] сеть Discord недоступна после ретраев: {e}")
+        return None
     if resp.status_code == 429:
         time.sleep(float(resp.json().get("retry_after", 1)) + 0.5)
-        return discord_request(payload, files)
+        return discord_request(payload, files, _attempt)
     return resp
 
 
 def discord_post(content, files=None):
     resp = discord_request({"content": content}, files or None)
-    if resp.status_code >= 400:
-        msg = f"[discord] ошибка {resp.status_code}: {resp.text[:300]}"
+    if resp is None or resp.status_code >= 400:
+        msg = f"[discord] ошибка {resp.status_code if resp else 'network'}: {resp.text[:300] if resp else '-'}"
         print(msg); FAILURES.append(msg)
         return False
     return True
@@ -157,8 +180,9 @@ def send_poll(msg):
         "allow_multiselect": poll.get("allows_multiple_answers", False),
     }}
     resp = discord_request(payload)
-    if resp.status_code >= 400:
-        m = f"[discord] опрос #{msg['message_id']} не отправлен {resp.status_code}: {resp.text[:300]}"
+    if resp is None or resp.status_code >= 400:
+        code = resp.status_code if resp else "network"
+        m = f"[discord] опрос #{msg['message_id']} не отправлен {code}: {resp.text[:300] if resp else '-'}"
         print(m); FAILURES.append(m)
         discord_post("📊 Опрос — смотрите в Telegram:\n" + post_link(msg))  # фолбэк ссылкой
     else:
@@ -186,9 +210,10 @@ def send_voice(msg):
         "duration_secs": duration, "waveform": waveform,
     }]}
     resp = discord_request(payload, [("voice-message.ogg", blob, "audio/ogg")])
-    if resp.status_code >= 400:
+    if resp is None or resp.status_code >= 400:
         # не считаем провалом: деградируем на обычное .ogg-вложение (+ подпись)
-        print(f"[warn] voice #{msg['message_id']} -> фолбэк на вложение ({resp.status_code}): {resp.text[:200]}")
+        code = resp.status_code if resp else "network"
+        print(f"[warn] voice #{msg['message_id']} -> фолбэк на вложение ({code}): {resp.text[:200] if resp else '-'}")
         discord_post(caption, [("voice-message.ogg", blob, "audio/ogg")])
         return
     print(f"[send] голосовое #{msg['message_id']} -> voice message")
@@ -266,23 +291,50 @@ def group_albums(posts):
     return groups
 
 
+def handle_updates(updates):
+    """Разбирает пачку апдейтов -> Discord. Возвращает число обработанных постов."""
+    posts = [u["channel_post"] for u in updates if "channel_post" in u]
+    if SOURCE_CHAT:
+        posts = [p for p in posts
+                 if str(p["chat"].get("id")) == str(SOURCE_CHAT)
+                 or ("@" + str(p["chat"].get("username", "")) == SOURCE_CHAT)]
+    for group in group_albums(posts):
+        send_group(group)
+    return len(posts)
+
+
 def main():
+    deadline = time.time() + LOOP_MINUTES * 60 if LOOP_MINUTES > 0 else None
+    offset = None  # None -> Telegram отдаст все ещё не подтверждённые апдейты
     total = 0
     while True:
-        updates = get_updates()  # накопившиеся, ещё не подтверждённые
-        posts = [u["channel_post"] for u in updates if "channel_post" in u]
-        if SOURCE_CHAT:
-            posts = [p for p in posts
-                     if str(p["chat"].get("id")) == str(SOURCE_CHAT)
-                     or ("@" + str(p["chat"].get("username", "")) == SOURCE_CHAT)]
-        for group in group_albums(posts):
-            send_group(group)
-            total += len(group)
-        if not updates:
+        # в цикле (deadline задан) — long polling; в разовом режиме — короткий запрос
+        wait = LONG_POLL_SECONDS if deadline else 0
+        try:
+            updates = get_updates(offset=offset, timeout=wait)
+        except requests.exceptions.RequestException as e:
+            # транзиентный сетевой сбой Telegram: не роняем цикл, ждём и повторяем
+            print(f"[warn] getUpdates сеть: {e}; повтор через 5с")
+            if deadline is None:
+                break
+            time.sleep(5)
+            continue
+        if updates:
+            total += handle_updates(updates)
+            offset = updates[-1]["update_id"] + 1  # подтвердится следующим getUpdates
+
+        if deadline is None:                 # разовый режим: дренаж и выход
+            if not updates or len(updates) < 100:
+                break
+        elif time.time() >= deadline:        # цикл: пора завершаться (следующий прогон встанет встык)
             break
-        get_updates(offset=updates[-1]["update_id"] + 1)  # подтверждаем разобранное
-        if len(updates) < 100:
-            break
+
+    if offset is not None:                   # финально подтверждаем последнюю пачку
+        try:
+            get_updates(offset=offset, timeout=0)
+        except Exception as e:
+            print(f"[warn] не удалось подтвердить offset при выходе: {e}")
+
     print(f"[ok] обработано постов: {total}")
     if FAILURES:
         print(f"[FAIL] ошибок отправки в Discord: {len(FAILURES)} — прогон помечен как упавший")

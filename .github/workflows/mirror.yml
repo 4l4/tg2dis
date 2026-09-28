@@ -1,12 +1,11 @@
 name: tg2dis mirror
 
 on:
-  # cron у GitHub ненадёжен и часто задерживается/пропускается, поэтому он тут
-  # нужен лишь чтобы ИНОГДА стартовать джоб. Сам опрос крутится циклом внутри
-  # запуска ~5.5 часа, а concurrency ставит следующий запуск встык в очередь —
-  # так получается почти непрерывный опрос каждые 10 минут без сторонних сервисов.
+  # cron у GitHub ненадёжен, поэтому он тут нужен лишь чтобы ИНОГДА стартовать джоб
+  # (и восстановить цепочку, если она оборвётся). Сам джоб держит long polling ~5.5ч
+  # и получает посты почти мгновенно; concurrency ставит следующий запуск встык.
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:          # ручной старт (и для «раскачки» цепочки после простоя)
 
 # один запуск в момент времени; следующий ждёт в очереди и стартует встык
@@ -24,7 +23,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - name: Poll loop
+      - name: Long polling
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_SOURCE_CHAT_ID: ${{ secrets.TG_SOURCE_CHAT_ID }}
@@ -32,17 +31,6 @@ jobs:
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           MAX_FILE_MB: "20"
           POLL_HOURS: "24"
-          LOOP_MINUTES: "330"     # крутим ~5.5ч, потом джоб завершается штатно
-          POLL_INTERVAL: "600"    # опрос каждые 10 минут
-        run: |
-          end=$(( $(date +%s) + LOOP_MINUTES * 60 ))
-          failed=0
-          while :; do
-            if ! python poll_bot.py; then
-              echo "::error::poll_bot.py завершился с ошибкой (подробности в логе выше)"
-              failed=1
-            fi
-            [ "$(date +%s)" -ge "$end" ] && break
-            sleep "$POLL_INTERVAL"
-          done
-          exit $failed
+          LOOP_MINUTES: "330"        # держим процесс ~5.5ч, потом штатный выход
+          LONG_POLL_SECONDS: "50"    # getUpdates висит до 50с -> посты приходят почти мгновенно
+        run: python poll_bot.py
