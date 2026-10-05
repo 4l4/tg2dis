@@ -21,6 +21,10 @@ tg2disbot (режим БОТА) — копирует посты из Telegram-к
   * голосовые (voice)       -> нативное voice message в Discord (с фолбэком на .ogg-вложение);
   * опросы (poll)           -> нативный опрос в Discord (таймер POLL_HOURS, по умолчанию 24ч).
 
+Форматирование Telegram (жирный, курсив, ссылки-под-текстом, цитаты, код, спойлеры...)
+переводится в Discord-markdown. Анонсы стримов (пост со ссылкой на kick.com / w.tv /
+goodgame.ru) уходят в отдельный канал DISCORD_ANNOUNCE_CHANNEL_ID с пингом @everyone.
+
 Файлы <=20 МБ пересылаются вложением; больше 20 МБ Bot API скачать не может —
 для них ставится ссылка на исходный пост в Telegram.
 """
@@ -28,6 +32,7 @@ tg2disbot (режим БОТА) — копирует посты из Telegram-к
 import base64
 import json
 import os
+import re
 import sys
 import time
 
@@ -44,6 +49,8 @@ except ImportError:
 TOKEN = os.environ["TG_BOT_TOKEN"]
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 DISCORD_CHANNEL_ID = os.environ["DISCORD_CHANNEL_ID"]
+# канал для анонсов стримов (пост со ссылкой на стрим-площадку) — с пингом @everyone
+DISCORD_ANNOUNCE_CHANNEL_ID = os.environ.get("DISCORD_ANNOUNCE_CHANNEL_ID") or "1550093981113778206"
 SOURCE_CHAT = os.environ.get("TG_SOURCE_CHAT_ID")  # необязательный фильтр (id или @username)
 MAX_FILE_BYTES = int(float(os.environ.get("MAX_FILE_MB", "20")) * 1024 * 1024)
 POLL_HOURS = int(os.environ.get("POLL_HOURS", "24"))  # таймер опроса в Discord
@@ -53,11 +60,16 @@ LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "0"))
 LONG_POLL_SECONDS = int(os.environ.get("LONG_POLL_SECONDS", "50"))
 
 API = f"https://api.telegram.org/bot{TOKEN}"
-DISCORD_API = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+DISCORD_API = "https://discord.com/api/v10/channels/{}/messages"
 DISCORD_HEADERS = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
 DISCORD_MSG_LIMIT = 2000
 DISCORD_FILES_LIMIT = 10
 FLAG_VOICE_MESSAGE = 1 << 13  # IS_VOICE_MESSAGE
+NO_MENTIONS = {"parse": []}           # текст из TG никого не пингует
+PING_EVERYONE = {"parse": ["everyone"]}
+
+# Ссылка на стрим-площадку (в т.ч. поддомены) -> пост считается анонсом
+ANNOUNCE_RE = re.compile(r"(?<![\w.-])(?:[\w-]+\.)*(?:kick\.com|w\.tv|goodgame\.ru)(?![\w-])", re.I)
 
 # обычные вложения (кружок отдаём как видео; voice/poll обрабатываются отдельно)
 MEDIA_KEYS = ("photo", "video", "video_note", "document", "audio", "animation")
@@ -112,12 +124,111 @@ def post_link(msg):
     cid = cid[4:] if cid.startswith("-100") else cid.lstrip("-")
     return f"https://t.me/c/{cid}/{mid}"
 
+def is_announce(msg):
+    """Анонс стрима: в тексте/подписи или в ссылках-под-текстом есть kick.com / w.tv / goodgame.ru."""
+    text = msg.get("text") or msg.get("caption") or ""
+    urls = [e.get("url", "") for e in (msg.get("entities") or msg.get("caption_entities") or [])]
+    return any(ANNOUNCE_RE.search(s) for s in [text, *urls])
+
+
+# ---------- Telegram-разметка -> Discord-markdown ----------
+
+# стили, которые оборачивают текст парой маркеров
+_WRAP = {"bold": "**", "italic": "*", "underline": "__", "strikethrough": "~~",
+         "spoiler": "||", "code": "`"}
+# сущности, внутри которых текст нельзя экранировать (иначе сломаются ссылки/адреса)
+_RAW = {"url", "email", "code", "pre", "mention", "hashtag", "cashtag", "bot_command", "phone_number"}
+_ESCAPE_RE = re.compile(r"([\\*_~`|])")
+_LINE_START_RE = re.compile(r"(^|\n)([#>])", re.M)
+_URL_RE = re.compile(r"https?://\S+|(?:[\w-]+\.)+[a-z]{2,}/\S*", re.I)
+_NL16 = "\n".encode("utf-16-le")
+
+
+def _escape(text):
+    """Экранирует символы, которые Discord иначе воспримет как разметку (ссылки не трогаем)."""
+    out, pos = [], 0
+    for m in _URL_RE.finditer(text):
+        out.append(_ESCAPE_RE.sub(r"\\\1", text[pos:m.start()]))
+        out.append(m.group())
+        pos = m.end()
+    out.append(_ESCAPE_RE.sub(r"\\\1", text[pos:]))
+    return _LINE_START_RE.sub(r"\1\\\2", "".join(out))
+
+
+def _u16(text):
+    return text.encode("utf-16-le")
+
+
+def _s16(b):
+    return b.decode("utf-16-le")
+
+
+def _render(buf, start, end, entities):
+    """Рендерит участок buf[start:end] (единицы UTF-16) с вложенными сущностями."""
+    out, pos, i = [], start, 0
+    while i < len(entities):
+        e = entities[i]
+        e_start, e_end = e["offset"], e["offset"] + e["length"]
+        # сущности, лежащие внутри текущей (Telegram гарантирует вложенность)
+        j = i + 1
+        while j < len(entities) and entities[j]["offset"] < e_end:
+            j += 1
+        if e_start > pos:
+            out.append(_escape(_s16(buf[pos * 2:e_start * 2])))
+        out.append(_render_entity(buf, e, entities[i + 1:j]))
+        pos, i = max(pos, e_end), j
+    if end > pos:
+        out.append(_escape(_s16(buf[pos * 2:end * 2])))
+    return "".join(out)
+
+
+def _render_entity(buf, e, inner):
+    start, end = e["offset"], e["offset"] + e["length"]
+    t = e["type"]
+    raw = _s16(buf[start * 2:end * 2])
+    if t in _RAW:
+        if t == "code":
+            return f"``{raw}``" if "`" in raw else f"`{raw}`"
+        if t == "pre":
+            return f"```{e.get('language', '')}\n{raw.rstrip(chr(10))}\n```"
+        return raw
+    body = _render(buf, start, end, inner)
+    if t == "text_link":
+        url = e.get("url", "")
+        return url if raw.strip() == url else f"[{body}]({url})"
+    if t in ("blockquote", "expandable_blockquote"):
+        quote = "\n".join("> " + line for line in body.split("\n"))
+        # цитата в Discord работает только с начала строки и до её конца
+        before = "\n" if start and buf[start * 2 - 2:start * 2] != _NL16 else ""
+        after = "\n" if end * 2 < len(buf) and buf[end * 2:end * 2 + 2] != _NL16 else ""
+        return before + quote + after
+    mark = _WRAP.get(t)
+    if not mark or not body.strip():
+        return body  # custom_emoji, text_mention и пр. — просто текст
+    # Discord не распознаёт "** текст **": выносим пробелы/переносы за маркеры
+    lead = body[:len(body) - len(body.lstrip())]
+    trail = body[len(body.rstrip()):]
+    return f"{lead}{mark}{body.strip()}{mark}{trail}"
+
+
+def tg_to_markdown(msg):
+    """Текст/подпись поста с Telegram-сущностями -> Discord-markdown."""
+    text = msg.get("text") or msg.get("caption") or ""
+    entities = msg.get("entities") or msg.get("caption_entities") or []
+    if not text:
+        return ""
+    entities = sorted(entities, key=lambda e: (e["offset"], -e["length"]))
+    buf = _u16(text)
+    return _render(buf, 0, len(buf) // 2, entities)
+
 
 # ---------- Discord ----------
 
-def discord_request(payload, files=None, _attempt=1):
+def discord_request(payload, files=None, channel=None, _attempt=1):
     """Отправка в Discord: multipart при файлах, иначе JSON.
     Ретрай на 429 и на сетевых сбоях. Возвращает Response или None (сеть недоступна)."""
+    url = DISCORD_API.format(channel or DISCORD_CHANNEL_ID)
+    payload = {"allowed_mentions": NO_MENTIONS, **payload}
     try:
         if files:
             data = {"payload_json": json.dumps(payload)}
@@ -126,25 +237,28 @@ def discord_request(payload, files=None, _attempt=1):
                 name, blob = f[0], f[1]
                 ctype = f[2] if len(f) > 2 else "application/octet-stream"
                 file_args.append((f"files[{i}]", (name, blob, ctype)))
-            resp = requests.post(DISCORD_API, headers=DISCORD_HEADERS,
+            resp = requests.post(url, headers=DISCORD_HEADERS,
                                  data=data, files=file_args, timeout=180)
         else:
-            resp = requests.post(DISCORD_API, headers={**DISCORD_HEADERS, "Content-Type": "application/json"},
+            resp = requests.post(url, headers={**DISCORD_HEADERS, "Content-Type": "application/json"},
                                  json=payload, timeout=60)
     except requests.exceptions.RequestException as e:
         if _attempt <= 3:
             time.sleep(2 * _attempt)
-            return discord_request(payload, files, _attempt + 1)
+            return discord_request(payload, files, channel, _attempt + 1)
         print(f"[warn] сеть Discord недоступна после ретраев: {e}")
         return None
     if resp.status_code == 429:
         time.sleep(float(resp.json().get("retry_after", 1)) + 0.5)
-        return discord_request(payload, files, _attempt)
+        return discord_request(payload, files, channel, _attempt)
     return resp
 
 
-def discord_post(content, files=None):
-    resp = discord_request({"content": content}, files or None)
+def discord_post(content, files=None, channel=None, mentions=None):
+    payload = {"content": content}
+    if mentions:
+        payload["allowed_mentions"] = mentions
+    resp = discord_request(payload, files or None, channel)
     if resp is None or resp.status_code >= 400:
         msg = f"[discord] ошибка {resp.status_code if resp else 'network'}: {resp.text[:300] if resp else '-'}"
         print(msg); FAILURES.append(msg)
@@ -193,7 +307,7 @@ def send_voice(msg):
     """Голосовое TG -> voice message Discord; при отказе — обычное .ogg-вложение."""
     v = msg["voice"]
     size = v.get("file_size", 0)
-    caption = (msg.get("caption") or "").strip()
+    caption = tg_to_markdown(msg).strip()
     if size and size > MAX_FILE_BYTES:
         discord_post("🎤 Голосовое сообщение (>20 МБ) — в Telegram:\n" + post_link(msg))
         return
@@ -222,10 +336,13 @@ def send_voice(msg):
 
 
 def send_media_group(posts):
-    """Текст + обычные вложения (в т.ч. альбомы и кружки-как-видео)."""
+    """Текст + обычные вложения (в т.ч. альбомы и кружки-как-видео).
+    Анонс стрима -> отдельный канал с @everyone."""
+    announce = any(is_announce(m) for m in posts)
+    channel = DISCORD_ANNOUNCE_CHANNEL_ID if announce else None
     texts, files, links = [], [], []
     for msg in posts:
-        t = msg.get("text") or msg.get("caption")
+        t = tg_to_markdown(msg).strip()
         if t:
             texts.append(t)
         media = extract_media(msg)
@@ -251,17 +368,23 @@ def send_media_group(posts):
         print(f"[warn] нечего отправить для поста(ов) #{ids} — тип не поддержан? поля: {keys}")
         return
     print(f"[send] пост(ы) #{','.join(str(m['message_id']) for m in posts)}: "
-          f"файлов {len(files)}, ссылок {len(links)}")
+          f"файлов {len(files)}, ссылок {len(links)}" + (" [анонс -> @everyone]" if announce else ""))
 
+    if announce:
+        text = "@everyone\n" + text
     chunks = chunk_text(text) if text else [""]
     batches = [files[i:i + DISCORD_FILES_LIMIT]
                for i in range(0, len(files), DISCORD_FILES_LIMIT)] or [[]]
     first = True
     for batch in batches:
-        discord_post(chunks.pop(0) if (first and chunks) else "", batch)
+        if first:
+            discord_post(chunks.pop(0) if chunks else "", batch, channel,
+                         PING_EVERYONE if announce else None)
+        else:
+            discord_post("", batch, channel)
         first = False
     for c in chunks:
-        discord_post(c)
+        discord_post(c, None, channel)
 
 
 def send_group(posts):

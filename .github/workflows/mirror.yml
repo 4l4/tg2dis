@@ -42,6 +42,7 @@ jobs:
           TG_SOURCE_CHAT_ID: ${{ secrets.TG_SOURCE_CHAT_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          DISCORD_ANNOUNCE_CHANNEL_ID: ${{ secrets.DISCORD_ANNOUNCE_CHANNEL_ID }}  # пусто -> канал по умолчанию из кода
           MAX_FILE_MB: "20"
           POLL_HOURS: "24"
           LOOP_MINUTES: "50"         # держим процесс ~50 мин, потом штатный выход
