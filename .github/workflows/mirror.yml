@@ -47,4 +47,4 @@ jobs:
           POLL_HOURS: "24"
           LOOP_MINUTES: "50"         # держим процесс ~50 мин, потом штатный выход
           LONG_POLL_SECONDS: "50"    # getUpdates висит до 50с -> посты приходят почти мгновенно
-        run: python poll_bot.py
+        run: python -u poll_bot.py   # -u: логи видны в Actions сразу, а не в конце прогона
