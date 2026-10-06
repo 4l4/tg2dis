@@ -260,7 +260,7 @@ def discord_post(content, files=None, channel=None, mentions=None):
         payload["allowed_mentions"] = mentions
     resp = discord_request(payload, files or None, channel)
     if resp is None or resp.status_code >= 400:
-        msg = f"[discord] ошибка {resp.status_code if resp else 'network'}: {resp.text[:300] if resp else '-'}"
+        msg = f"[discord] ошибка {resp.status_code if resp is not None else 'network'}: {resp.text[:300] if resp is not None else '-'}"
         print(msg); FAILURES.append(msg)
         return False
     return True
@@ -295,8 +295,8 @@ def send_poll(msg):
     }}
     resp = discord_request(payload)
     if resp is None or resp.status_code >= 400:
-        code = resp.status_code if resp else "network"
-        m = f"[discord] опрос #{msg['message_id']} не отправлен {code}: {resp.text[:300] if resp else '-'}"
+        code = resp.status_code if resp is not None else "network"
+        m = f"[discord] опрос #{msg['message_id']} не отправлен {code}: {resp.text[:300] if resp is not None else '-'}"
         print(m); FAILURES.append(m)
         discord_post("📊 Опрос — смотрите в Telegram:\n" + post_link(msg))  # фолбэк ссылкой
     else:
@@ -326,8 +326,8 @@ def send_voice(msg):
     resp = discord_request(payload, [("voice-message.ogg", blob, "audio/ogg")])
     if resp is None or resp.status_code >= 400:
         # не считаем провалом: деградируем на обычное .ogg-вложение (+ подпись)
-        code = resp.status_code if resp else "network"
-        print(f"[warn] voice #{msg['message_id']} -> фолбэк на вложение ({code}): {resp.text[:200] if resp else '-'}")
+        code = resp.status_code if resp is not None else "network"
+        print(f"[warn] voice #{msg['message_id']} -> фолбэк на вложение ({code}): {resp.text[:200] if resp is not None else '-'}")
         discord_post(caption, [("voice-message.ogg", blob, "audio/ogg")])
         return
     print(f"[send] голосовое #{msg['message_id']} -> voice message")
